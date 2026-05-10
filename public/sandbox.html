@@ -1,0 +1,174 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>JS sandbox</title>
+    <!--
+      In-browser test harness for the conversational mock interview.
+      Loaded into a sandboxed iframe (`sandbox="allow-scripts"` — no same-origin,
+      no top-level navigation). The parent posts:
+        { type: 'run', code: string, testCases: TestCase[], timeoutMs: number, runId: string }
+      The harness posts back:
+        { type: 'result', runId, payload: RunResult }
+
+      Notes:
+      - We do NOT allow async test cases by default; if the candidate's solution
+        returns a Promise, we await it within the wall-clock timeout.
+      - `console.log` output is captured into stdout (truncated to 2KB).
+      - A single-thread soft timeout — if a test runs past `timeoutMs` we abort
+        the whole run with fatal_error. We can't preempt sync infinite loops,
+        but the iframe is throwaway: parent will discard it on timeout.
+    -->
+  </head>
+  <body>
+    <script>
+      (function () {
+        function deepEqual(a, b) {
+          if (a === b) return true;
+          if (typeof a !== typeof b) return false;
+          if (a === null || b === null) return false;
+          if (Array.isArray(a) && Array.isArray(b)) {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false;
+            return true;
+          }
+          if (typeof a === "object") {
+            const ak = Object.keys(a).sort();
+            const bk = Object.keys(b).sort();
+            if (ak.length !== bk.length) return false;
+            for (let i = 0; i < ak.length; i++) {
+              if (ak[i] !== bk[i]) return false;
+              if (!deepEqual(a[ak[i]], b[bk[i]])) return false;
+            }
+            return true;
+          }
+          // NaN handling
+          if (typeof a === "number" && typeof b === "number" && isNaN(a) && isNaN(b)) return true;
+          return false;
+        }
+
+        function captureConsole() {
+          const buf = [];
+          const orig = window.console.log;
+          window.console.log = function (...args) {
+            try {
+              buf.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+            } catch {
+              buf.push("[unserializable]");
+            }
+          };
+          return {
+            getOutput() {
+              const s = buf.join("\n");
+              return s.length > 2048 ? s.slice(0, 2048) + "\n... [truncated]" : s;
+            },
+            restore() {
+              window.console.log = orig;
+            },
+          };
+        }
+
+        async function runTests(code, testCases, timeoutMs) {
+          const start = performance.now();
+          const cap = captureConsole();
+
+          let solution;
+          try {
+            // Wrap user code so they can either define `function solution(...)`
+            // or `const solution = (...) => ...` or use `module.exports = ...`.
+            // We `return solution` from a Function so the outer scope captures it.
+            const wrapper = new Function(
+              `"use strict";
+               ${code}
+               if (typeof solution === 'undefined') {
+                 throw new Error("Define a function named 'solution' (e.g. function solution(...) { ... })");
+               }
+               return solution;`
+            );
+            solution = wrapper();
+          } catch (e) {
+            cap.restore();
+            return {
+              passed: 0,
+              total: testCases.length,
+              results: [],
+              stdout: cap.getOutput(),
+              runtime_ms: Math.round(performance.now() - start),
+              fatal_error: "Compile error: " + (e && e.message ? e.message : String(e)),
+            };
+          }
+
+          const results = [];
+          let passedCount = 0;
+
+          for (const tc of testCases) {
+            const tName = tc.name || "test";
+            try {
+              const callPromise = Promise.resolve().then(() => solution.apply(null, tc.args || []));
+              const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Test timeout (" + timeoutMs + "ms)")), timeoutMs)
+              );
+              const actual = await Promise.race([callPromise, timeoutPromise]);
+              const passed = deepEqual(actual, tc.expected);
+              if (passed) passedCount++;
+              results.push({
+                name: tName,
+                passed,
+                expected: tc.expected,
+                actual,
+                error: null,
+                hidden: !!tc.hidden,
+              });
+            } catch (e) {
+              results.push({
+                name: tName,
+                passed: false,
+                expected: tc.expected,
+                actual: null,
+                error: e && e.message ? e.message : String(e),
+                hidden: !!tc.hidden,
+              });
+            }
+          }
+
+          cap.restore();
+          return {
+            passed: passedCount,
+            total: testCases.length,
+            results,
+            stdout: cap.getOutput(),
+            runtime_ms: Math.round(performance.now() - start),
+            fatal_error: null,
+          };
+        }
+
+        window.addEventListener("message", async function (event) {
+          const data = event.data;
+          if (!data || data.type !== "run") return;
+          const { runId, code, testCases, timeoutMs } = data;
+          let payload;
+          try {
+            payload = await runTests(code, testCases || [], timeoutMs || 2000);
+          } catch (e) {
+            payload = {
+              passed: 0,
+              total: (testCases || []).length,
+              results: [],
+              stdout: "",
+              runtime_ms: 0,
+              fatal_error: "Harness error: " + (e && e.message ? e.message : String(e)),
+            };
+          }
+          // Echo back to whoever sent the message.
+          (event.source || window.parent).postMessage(
+            { type: "result", runId, payload },
+            "*"
+          );
+        });
+
+        // Signal readiness so the parent can stop polling and run.
+        window.parent.postMessage({ type: "ready" }, "*");
+      })();
+    </script>
+  </body>
+</html>
