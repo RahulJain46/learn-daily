@@ -214,3 +214,40 @@ export async function getRecentMockInterviews(limit = 10) {
   if (error) return [];
   return data;
 }
+
+// How many cards are *eligible* for each mock-interview mode.
+//
+// Mirrors the category filters used by `startMockInterview` so the listing
+// page only advertises modes the user can actually run. We use HEAD count
+// queries (`count: 'exact', head: true`) which do not transfer rows — just
+// the integer — so this stays cheap even as the catalog grows.
+export async function getMockInterviewCardCounts(): Promise<
+  Record<MockInterviewMode, number>
+> {
+  const supabase = await createClient();
+
+  const [mixed, dsa, sd, behavioral] = await Promise.all([
+    supabase
+      .from("cards")
+      .select("id", { count: "exact", head: true }),
+    supabase
+      .from("cards")
+      .select("id, entries!inner(category)", { count: "exact", head: true })
+      .in("entries.category", ["dsa"]),
+    supabase
+      .from("cards")
+      .select("id, entries!inner(category)", { count: "exact", head: true })
+      .in("entries.category", ["system_design", "backend"]),
+    supabase
+      .from("cards")
+      .select("id, entries!inner(category)", { count: "exact", head: true })
+      .in("entries.category", ["concepts", "system_design"]),
+  ]);
+
+  return {
+    dsa: dsa.count ?? 0,
+    system_design: sd.count ?? 0,
+    mixed: mixed.count ?? 0,
+    behavioral: behavioral.count ?? 0,
+  };
+}
